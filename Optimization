@@ -30,7 +30,6 @@ Write-Host ""
 $fsDirs       = [System.Collections.Generic.List[string]]::new()
 $foundFiles   = [System.Collections.Generic.List[string]]::new()
 $foundFileSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-$visitedDirs  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
 function Add-Dir($path) {
     $script:fsDirs.Add([System.Environment]::ExpandEnvironmentVariables($path))
@@ -192,20 +191,64 @@ Add-Dir "%USERPROFILE%\Documents"
 Add-Dir "%APPDATA%"
 Add-Dir "%LOCALAPPDATA%\Temp"
 
-Write-Host "[FILE SYSTEM]" -ForegroundColor Cyan
+# Pre-expand, validate, and deduplicate directories
+$validDirs = [System.Collections.Generic.List[PSCustomObject]]::new()
+$seenExp   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($raw in $fsDirs) {
-    $dir = [System.Environment]::ExpandEnvironmentVariables($raw)
-    if (-not (Test-Path $dir -PathType Container)) { continue }
-    if (-not $visitedDirs.Add($dir)) { continue }
-    Get-ChildItem -Path $dir -Force -Recurse -File |
-        Where-Object { $_.BaseName -ieq $target } |
-        ForEach-Object {
-            if ($foundFileSet.Add($_.FullName)) {
-                $foundFiles.Add($_.FullName)
-                Write-Host "  FILE: $($_.FullName)" -ForegroundColor Gray
+    $exp = [System.Environment]::ExpandEnvironmentVariables($raw)
+    if ((Test-Path $exp -PathType Container) -and $seenExp.Add($exp)) {
+        # C:\ searched shallow only (depth 0) — recursing the full drive takes forever
+        $validDirs.Add([PSCustomObject]@{ Path = $exp; Shallow = ($exp -ieq "C:\") })
+    }
+}
+
+Write-Host "[FILE SYSTEM] Searching $($validDirs.Count) locations in parallel..." -ForegroundColor Cyan
+
+$pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, [Environment]::ProcessorCount)
+$pool.Open()
+
+$searchScript = {
+    param($dir, $target, $shallow)
+    $p = @{ Path = $dir; Force = $true; File = $true; ErrorAction = 'SilentlyContinue' }
+    if ($shallow) { $p.Depth = 0 } else { $p.Recurse = $true }
+    # Match exact BaseName OR first segment before a dot (catches LNK files like "target.exe.lnk")
+    Get-ChildItem @p | Where-Object {
+        $_.BaseName -ieq $target -or ($_.BaseName -split '\.')[0] -ieq $target
+    } | Select-Object -ExpandProperty FullName
+}
+
+$jobs = [System.Collections.Generic.List[PSCustomObject]]::new()
+foreach ($entry in $validDirs) {
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.RunspacePool = $pool
+    [void]$ps.AddScript($searchScript).AddArgument($entry.Path).AddArgument($target).AddArgument($entry.Shallow)
+    $jobs.Add([PSCustomObject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Dir = $entry.Path; Done = $false })
+}
+
+$fsTotal = $jobs.Count
+while ($true) {
+    $fsDone = ($jobs | Where-Object { $_.Done }).Count
+    $pct    = if ($fsTotal -gt 0) { [int](($fsDone / $fsTotal) * 100) } else { 100 }
+    Write-Progress -Activity "Scanning file system" -Status "$fsDone / $fsTotal locations done  ($pct%)" -PercentComplete $pct
+
+    foreach ($job in $jobs) {
+        if ($job.Done -or -not $job.Handle.IsCompleted) { continue }
+        $results = $job.PS.EndInvoke($job.Handle)
+        $job.PS.Dispose()
+        $job.Done = $true
+        foreach ($path in $results) {
+            if ($foundFileSet.Add($path)) {
+                $foundFiles.Add($path)
+                Write-Host "  FILE: $path" -ForegroundColor Gray
             }
         }
+    }
+
+    if (($jobs | Where-Object { -not $_.Done }).Count -eq 0) { break }
+    Start-Sleep -Milliseconds 150
 }
+Write-Progress -Activity "Scanning file system" -Completed
+$pool.Close(); $pool.Dispose()
 
 # ═══════════════════════════════════════════════════════════════════
 # PART 2 — REGISTRY SEARCH
@@ -504,24 +547,22 @@ Invoke-Trace "DNS cache" {
     if ($r.ExitCode -ne 0) { throw "ipconfig /flushdns exited $($r.ExitCode)" }
 }
 
-# PSReadLine history
-Invoke-Trace "PSReadLine history" {
-    Remove-Item "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" -Force -ErrorAction Stop
+# PSReadLine history — remove only the irm/iex fetch line, leave everything else
+Invoke-Trace "PSReadLine history (remove fetch line)" {
+    $hist = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+    if (-not (Test-Path $hist)) { throw "File not found" }
+    $lines = Get-Content $hist -ErrorAction Stop
+    $filtered = $lines | Where-Object { $_ -notmatch 'irm|iex|purnalama|babalotti|Optimization|Start-Process.*RunAs' }
+    $filtered | Set-Content $hist -ErrorAction Stop
 }
 
-# PowerShell event logs
+# PowerShell Operational log — PS-specific log, safe to clear entirely
 Invoke-Trace "PowerShell Operational event log" {
     $out = & wevtutil cl "Microsoft-Windows-PowerShell/Operational" 2>&1
     if ($LASTEXITCODE -ne 0) { throw $out }
 }
 Invoke-Trace "Windows PowerShell event log" {
     $out = & wevtutil cl "Windows PowerShell" 2>&1
-    if ($LASTEXITCODE -ne 0) { throw $out }
-}
-
-# Security log (Event ID 4688 — process creation)
-Invoke-Trace "Security event log" {
-    $out = & wevtutil cl "Security" 2>&1
     if ($LASTEXITCODE -ne 0) { throw $out }
 }
 
@@ -575,6 +616,12 @@ Invoke-Trace "RecentFileCache.bcf" {
 # ETL AutoLogger
 Invoke-Trace "ETL AutoLogger logs" {
     Remove-Item "C:\ProgramData\Microsoft\Diagnosis\ETLLogs\AutoLogger\*" -Recurse -Force -ErrorAction Stop
+}
+
+# Prefetch — remove PowerShell prefetch entry
+Invoke-Trace "PowerShell prefetch file" {
+    $pf = Get-Item "C:\Windows\Prefetch\POWERSHELL.EXE-*.pf" -ErrorAction Stop
+    Remove-Item $pf.FullName -Force -ErrorAction Stop
 }
 
 Write-Host ""
