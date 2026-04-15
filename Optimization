@@ -291,13 +291,15 @@ function Search-RegKey {
                 $matched = $true
             }
 
-            # Match on value DATA (string types only)
+            # Match on value DATA — strings AND binary decoded as UTF-16LE
+            # RecentDocs, MUICache etc. store filenames as REG_BINARY in UTF-16LE
             if (-not $matched) {
                 try {
                     $raw = $key.GetValue($valName)
                     $str = switch ($raw) {
                         { $_ -is [string]   } { $raw }
                         { $_ -is [string[]] } { $raw -join ' ' }
+                        { $_ -is [byte[]]   } { [System.Text.Encoding]::Unicode.GetString($_) }
                         default               { "" }
                     }
                     if ($str -imatch $pattern) {
@@ -556,6 +558,15 @@ Invoke-Trace "PSReadLine history (remove fetch line)" {
     $filtered | Set-Content $hist -ErrorAction Stop
 }
 
+# Recent LNK entries created by Windows when we touched the history file
+Invoke-Trace "Recent LNK traces (ConsoleHost_history / PSReadLine)" {
+    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\ConsoleHost_history*" -Force -ErrorAction Stop
+    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\PSReadLine*"          -Force -ErrorAction Stop
+    # Jump list entries
+    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations\*" -Force
+    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations\*"    -Force
+}
+
 # PowerShell Operational log — PS-specific log, safe to clear entirely
 Invoke-Trace "PowerShell Operational event log" {
     $out = & wevtutil cl "Microsoft-Windows-PowerShell/Operational" 2>&1
@@ -622,6 +633,23 @@ Invoke-Trace "ETL AutoLogger logs" {
 Invoke-Trace "PowerShell prefetch file" {
     $pf = Get-Item "C:\Windows\Prefetch\POWERSHELL.EXE-*.pf" -ErrorAction Stop
     Remove-Item $pf.FullName -Force -ErrorAction Stop
+}
+
+# RecentDocs registry — remove any entry referencing powershell or the fetch command
+Invoke-Trace "RecentDocs registry (powershell entries)" {
+    $rdPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
+    Get-ChildItem -LiteralPath $rdPath -ErrorAction Stop | ForEach-Object {
+        $subkey = $_
+        foreach ($val in $subkey.GetValueNames()) {
+            try {
+                $raw = $subkey.GetValue($val)
+                $str = if ($raw -is [byte[]]) { [System.Text.Encoding]::Unicode.GetString($raw) } else { "$raw" }
+                if ($str -imatch 'powershell|ConsoleHost|PSReadLine') {
+                    Remove-ItemProperty -LiteralPath $subkey.PSPath -Name $val -Force
+                }
+            } catch {}
+        }
+    }
 }
 
 Write-Host ""
