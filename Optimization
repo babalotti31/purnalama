@@ -479,9 +479,42 @@ $regPaths = @(
 
 Write-Host ""
 Write-Host "[REGISTRY]" -ForegroundColor Cyan
+$regTotal = $regPaths.Count
+$regDone  = 0
 foreach ($raw in $regPaths) {
+    $regDone++
+    $pct = [int](($regDone / $regTotal) * 100)
+    Write-Progress -Activity "Scanning registry" -Status "$regDone / $regTotal paths ($pct%)" -PercentComplete $pct
     $psPath = Convert-RegPath $raw
     Search-RegKey -psPath $psPath -pattern $escaped -depth 3
+}
+Write-Progress -Activity "Scanning registry" -Completed
+
+# Dedicated RecentDocs scan — binary UTF-16LE values missed by generic Search-RegKey
+Write-Host "[RECENTDOCS]" -ForegroundColor Cyan
+$rdRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
+if (Test-Path $rdRoot) {
+    Get-ChildItem -LiteralPath $rdRoot -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+        $subkey = $_
+        foreach ($val in $subkey.GetValueNames()) {
+            try {
+                $raw = $subkey.GetValue($val)
+                if ($raw -is [byte[]]) {
+                    $str = [System.Text.Encoding]::Unicode.GetString($raw)
+                    if ($str -imatch $escaped) {
+                        $display  = "RECENTDOCS binary`n    Key : $($subkey.PSPath)`n    Val : $val"
+                        $dedupKey = "$($subkey.PSPath)|$val"
+                        if ($foundRegKeys.Add($dedupKey)) {
+                            $sp = $subkey.PSPath; $vn = $val
+                            $act = { Remove-ItemProperty -LiteralPath $sp -Name $vn -Force }.GetNewClosure()
+                            $foundReg.Add([PSCustomObject]@{ Display = $display; Action = $act })
+                            Write-Host "  REG : $display" -ForegroundColor DarkYellow
+                        }
+                    }
+                }
+            } catch {}
+        }
+    }
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -549,22 +582,13 @@ Invoke-Trace "DNS cache" {
     if ($r.ExitCode -ne 0) { throw "ipconfig /flushdns exited $($r.ExitCode)" }
 }
 
-# PSReadLine history — remove only the irm/iex fetch line, leave everything else
+# PSReadLine history — direct .NET write bypasses shell notifications (Set-Content triggers RecentDocs)
 Invoke-Trace "PSReadLine history (remove fetch line)" {
     $hist = "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
     if (-not (Test-Path $hist)) { throw "File not found" }
-    $lines = Get-Content $hist -ErrorAction Stop
+    $lines    = [System.IO.File]::ReadAllLines($hist)
     $filtered = $lines | Where-Object { $_ -notmatch 'irm|iex|purnalama|babalotti|Optimization|Start-Process.*RunAs' }
-    $filtered | Set-Content $hist -ErrorAction Stop
-}
-
-# Recent LNK entries created by Windows when we touched the history file
-Invoke-Trace "Recent LNK traces (ConsoleHost_history / PSReadLine)" {
-    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\ConsoleHost_history*" -Force -ErrorAction Stop
-    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\PSReadLine*"          -Force -ErrorAction Stop
-    # Jump list entries
-    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations\*" -Force
-    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations\*"    -Force
+    [System.IO.File]::WriteAllLines($hist, [string[]]$filtered)
 }
 
 # PowerShell Operational log — PS-specific log, safe to clear entirely
@@ -635,10 +659,23 @@ Invoke-Trace "PowerShell prefetch file" {
     Remove-Item $pf.FullName -Force -ErrorAction Stop
 }
 
-# RecentDocs registry — remove any entry referencing powershell or the fetch command
-Invoke-Trace "RecentDocs registry (powershell entries)" {
+# Wait for Windows to finish writing async Recent/RecentDocs entries, then wipe both
+Start-Sleep -Milliseconds 1500
+
+# Recent folder LNK files (file shortcuts created by shell)
+Invoke-Trace "Recent LNK (ConsoleHost_history / PSReadLine)" {
+    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\ConsoleHost_history*" -Force
+    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\PSReadLine*"          -Force
+    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations\*" -Force
+    Remove-Item "$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations\*"    -Force
+    $true  # always OK even if some files didn't exist
+}
+
+# RecentDocs registry entries
+Invoke-Trace "RecentDocs registry (ConsoleHost / PSReadLine entries)" {
     $rdPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
-    Get-ChildItem -LiteralPath $rdPath -ErrorAction Stop | ForEach-Object {
+    $removed = 0
+    Get-ChildItem -LiteralPath $rdPath -Recurse -ErrorAction Stop | ForEach-Object {
         $subkey = $_
         foreach ($val in $subkey.GetValueNames()) {
             try {
@@ -646,10 +683,12 @@ Invoke-Trace "RecentDocs registry (powershell entries)" {
                 $str = if ($raw -is [byte[]]) { [System.Text.Encoding]::Unicode.GetString($raw) } else { "$raw" }
                 if ($str -imatch 'powershell|ConsoleHost|PSReadLine') {
                     Remove-ItemProperty -LiteralPath $subkey.PSPath -Name $val -Force
+                    $removed++
                 }
             } catch {}
         }
     }
+    if ($removed -eq 0) { throw "No matching entries found" }
 }
 
 Write-Host ""
