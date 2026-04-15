@@ -490,12 +490,13 @@ foreach ($raw in $regPaths) {
 }
 Write-Progress -Activity "Scanning registry" -Completed
 
-# Dedicated RecentDocs scan — binary UTF-16LE values missed by generic Search-RegKey
+# Dedicated RecentDocs scan — root key + all subkeys, binary UTF-16LE
+# Get-ChildItem alone misses the root key's own values (e.g. "0"="adas.txt" lives at root)
 Write-Host "[RECENTDOCS]" -ForegroundColor Cyan
 $rdRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
 if (Test-Path $rdRoot) {
-    Get-ChildItem -LiteralPath $rdRoot -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-        $subkey = $_
+    $rdKeys = @(Get-Item -LiteralPath $rdRoot) + @(Get-ChildItem -LiteralPath $rdRoot -Recurse -ErrorAction SilentlyContinue)
+    foreach ($subkey in $rdKeys) {
         foreach ($val in $subkey.GetValueNames()) {
             try {
                 $raw = $subkey.GetValue($val)
@@ -673,10 +674,11 @@ Invoke-Trace "Recent LNK (ConsoleHost_history / PSReadLine)" {
 
 # RecentDocs registry entries
 Invoke-Trace "RecentDocs registry (ConsoleHost / PSReadLine entries)" {
-    $rdPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
+    $rdPath  = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
     $removed = 0
-    Get-ChildItem -LiteralPath $rdPath -Recurse -ErrorAction Stop | ForEach-Object {
-        $subkey = $_
+    # Must check root key AND subkeys — ConsoleHost/PSReadLine entries live at the root level
+    $rdKeys  = @(Get-Item -LiteralPath $rdPath) + @(Get-ChildItem -LiteralPath $rdPath -Recurse -ErrorAction SilentlyContinue)
+    foreach ($subkey in $rdKeys) {
         foreach ($val in $subkey.GetValueNames()) {
             try {
                 $raw = $subkey.GetValue($val)
