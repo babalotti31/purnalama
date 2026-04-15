@@ -1,0 +1,581 @@
+# FileFinder — searches every file-system location AND registry path from message (3).txt
+# Finds any file or registry value whose name/data matches the input, then deletes them.
+# Run via FileFinder.bat (auto-elevates to Admin).
+
+$ErrorActionPreference = "SilentlyContinue"
+$host.UI.RawUI.WindowTitle = "FileFinder"
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "ERROR: Run as Administrator." -ForegroundColor Red
+    pause; exit
+}
+
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host "   FileFinder — Search & Delete by Name   " -ForegroundColor Cyan
+Write-Host "   (File System + Registry)               " -ForegroundColor Cyan
+Write-Host "==========================================" -ForegroundColor Cyan
+Write-Host ""
+$target = Read-Host "Enter filename to search (without extension)"
+if ([string]::IsNullOrWhiteSpace($target)) { Write-Host "No input. Exiting."; exit }
+$escaped = [regex]::Escape($target)
+
+Write-Host ""
+Write-Host "Searching for: '$target' across all file locations and registry paths..." -ForegroundColor Yellow
+Write-Host ""
+
+# ═══════════════════════════════════════════════════════════════════
+# PART 1 — FILE SYSTEM SEARCH
+# ═══════════════════════════════════════════════════════════════════
+
+$fsDirs       = [System.Collections.Generic.List[string]]::new()
+$foundFiles   = [System.Collections.Generic.List[string]]::new()
+$foundFileSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$visitedDirs  = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+function Add-Dir($path) {
+    $script:fsDirs.Add([System.Environment]::ExpandEnvironmentVariables($path))
+}
+
+# Prefetch & Execution Evidence
+Add-Dir "C:\Windows\Prefetch"
+Add-Dir "C:\Windows\AppCompat\Programs"
+Add-Dir "C:\Windows\appcompat\appraiser"
+Add-Dir "C:\Windows\appcompat\pca"
+Add-Dir "C:\ProgramData\Microsoft\Windows\AppRepository"
+Add-Dir "C:\ProgramData\Microsoft\Search\Data\Applications\Windows"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Windows"
+
+# LNK / Jump List / Shell / Recent
+Add-Dir "%APPDATA%\Microsoft\Windows\Recent"
+Add-Dir "%APPDATA%\Microsoft\Windows\Recent\AutomaticDestinations"
+Add-Dir "%APPDATA%\Microsoft\Windows\Recent\CustomDestinations"
+Add-Dir "%APPDATA%\Microsoft\Windows\SendTo"
+Add-Dir "C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+Add-Dir "%APPDATA%\Microsoft\Windows\Start Menu\Programs"
+Add-Dir "%LOCALAPPDATA%"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Windows\Explorer"
+
+# Event Logs
+Add-Dir "C:\Windows\System32\winevt\Logs"
+
+# SRUM / Timeline / Activity
+Add-Dir "C:\Windows\System32\SRU"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Windows\Timeline"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Windows\Notifications"
+$cdp = [System.Environment]::ExpandEnvironmentVariables("%LOCALAPPDATA%\ConnectedDevicesPlatform")
+if (Test-Path $cdp) {
+    $fsDirs.Add($cdp)
+    Get-ChildItem -Path $cdp -Directory -Force | ForEach-Object { $fsDirs.Add($_.FullName) }
+}
+
+# Power / Hibernation / Dumps
+Add-Dir "C:\"
+Add-Dir "%SystemRoot%\Minidump"
+Add-Dir "C:\ProgramData\Microsoft\Windows\WER\ReportArchive"
+Add-Dir "C:\ProgramData\Microsoft\Windows\WER\ReportQueue"
+Add-Dir "C:\Windows\Temp"
+
+# Hive / Config
+Add-Dir "C:\Windows\System32\config"
+Add-Dir "C:\Windows\System32\config\systemprofile\AppData"
+Add-Dir "%USERPROFILE%"
+Add-Dir "%USERPROFILE%\AppData\Local\Microsoft\Windows"
+Add-Dir "C:\Windows\ServiceProfiles\LocalService"
+Add-Dir "C:\Windows\ServiceProfiles\NetworkService"
+
+# Network / Firewall Logs
+Add-Dir "C:\Windows\System32\LogFiles\Firewall"
+Add-Dir "C:\Windows\System32\LogFiles\HTTPERR"
+Add-Dir "C:\Windows\System32\LogFiles\W3SVC1"
+Add-Dir "C:\Windows\System32\LogFiles\WMI"
+Add-Dir "C:\inetpub\logs\LogFiles"
+Add-Dir "C:\Windows\System32\dns"
+Add-Dir "C:\Windows\debug"
+Add-Dir "%ProgramData%\Microsoft\Network\Downloader"
+Add-Dir "C:\ProgramData\Microsoft\Windows Defender\Support"
+Add-Dir "C:\ProgramData\Microsoft\Windows Defender\Scans\History"
+Add-Dir "C:\ProgramData\Microsoft\Windows Defender\Quarantine"
+
+# PowerShell / Script / Tasks
+Add-Dir "%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine"
+Add-Dir "%SystemRoot%\System32\WindowsPowerShell\v1.0\Modules"
+Add-Dir "%USERPROFILE%\Documents\WindowsPowerShell"
+Add-Dir "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Windows PowerShell"
+Add-Dir "C:\Windows\System32\Tasks"
+Add-Dir "C:\Windows\SysWOW64\Tasks"
+Add-Dir "C:\Windows\System32\Tasks\Microsoft\Windows"
+Add-Dir "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup"
+Add-Dir "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup"
+
+# ETL / Diagnostics
+Add-Dir "C:\ProgramData\Microsoft\Diagnosis\ETLLogs"
+Add-Dir "C:\ProgramData\Microsoft\Diagnosis\ETLLogs\ShutdownLogger"
+Add-Dir "C:\ProgramData\Microsoft\Diagnosis\ETLLogs\AutoLogger"
+Add-Dir "C:\ProgramData\Microsoft\Diagnosis"
+Add-Dir "C:\Windows\System32\WDI\LogFiles"
+Add-Dir "C:\Windows\System32\WDI"
+Add-Dir "C:\ProgramData\Microsoft\Windows\WER"
+Add-Dir "C:\ProgramData\Microsoft\Windows\Reliability"
+Add-Dir "C:\Windows\Logs\WindowsUpdate"
+Add-Dir "C:\Windows\SoftwareDistribution"
+Add-Dir "C:\Windows\Logs\CBS"
+Add-Dir "C:\Windows\Logs\DISM"
+Add-Dir "C:\Windows\Logs\MoSetup"
+Add-Dir "C:\Windows\Panther"
+Add-Dir "C:\Windows\Panther\UnattendGC"
+Add-Dir "C:\Windows\INF"
+Add-Dir "C:\Windows\System32\sysprep\Panther"
+Add-Dir "C:\`$Windows.~BT\Sources\Panther"
+
+# WMI / COM
+Add-Dir "C:\Windows\System32\wbem\Repository"
+Add-Dir "C:\Windows\SysWOW64\wbem\Repository"
+Add-Dir "C:\Windows\System32\wbem\Logs"
+Add-Dir "C:\Windows\System32\wbem\AutoRecover"
+
+# Credentials / DPAPI / Vault
+Add-Dir "%APPDATA%\Microsoft\Credentials"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Credentials"
+Add-Dir "%APPDATA%\Microsoft\Protect"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Protect"
+Add-Dir "%APPDATA%\Microsoft\Vault"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Vault"
+Add-Dir "C:\ProgramData\Microsoft\Crypto\RSA\MachineKeys"
+Add-Dir "%APPDATA%\Microsoft\Crypto\RSA"
+Add-Dir "%APPDATA%\Microsoft\SystemCertificates"
+Add-Dir "%LOCALAPPDATA%\Microsoft\TokenBroker\Cache"
+Add-Dir "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\Microsoft\Credentials"
+
+# Browsers
+Add-Dir "%LOCALAPPDATA%\Google\Chrome\User Data"
+Add-Dir "%LOCALAPPDATA%\Google\Chrome\User Data\Default"
+Add-Dir "%LOCALAPPDATA%\Google\Chrome\User Data\Default\Cache"
+Add-Dir "%LOCALAPPDATA%\Google\Chrome\User Data\Default\Code Cache"
+Add-Dir "%LOCALAPPDATA%\Google\Chrome\User Data\Default\Sessions"
+Add-Dir "%LOCALAPPDATA%\Google\Chrome\User Data\Default\Network"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Edge\User Data"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Edge\User Data\Default"
+Add-Dir "%LOCALAPPDATA%\Microsoft\Edge\User Data\Default\Cache"
+$ffProfiles = [System.Environment]::ExpandEnvironmentVariables("%APPDATA%\Mozilla\Firefox\Profiles")
+if (Test-Path $ffProfiles) {
+    $fsDirs.Add($ffProfiles)
+    Get-ChildItem -Path $ffProfiles -Directory -Force | ForEach-Object {
+        $fsDirs.Add($_.FullName)
+        $c = Join-Path $_.FullName "Cache"; if (Test-Path $c) { $fsDirs.Add($c) }
+    }
+}
+Add-Dir "%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data"
+Add-Dir "%LOCALAPPDATA%\BraveSoftware\Brave-Browser\User Data\Default"
+Add-Dir "%APPDATA%\Opera Software\Opera Stable"
+Add-Dir "%LOCALAPPDATA%\Vivaldi\User Data\Default"
+
+# App Logs / MRU / Installer
+Add-Dir "%APPDATA%\Microsoft\Office\Recent"
+Add-Dir "%LOCALAPPDATA%\Packages"
+Add-Dir "C:\ProgramData\Microsoft\Windows\Start Menu"
+Add-Dir "C:\ProgramData\Microsoft\ClickToRun\MachineData"
+Add-Dir "C:\Windows\Installer"
+Add-Dir "%LOCALAPPDATA%\Temp"
+Add-Dir "C:\Temp"
+Add-Dir "%TEMP%"
+
+# Shadow Copy / VSS / Backup
+Add-Dir "C:\System Volume Information"
+Add-Dir "C:\Windows\Logs\WindowsBackup"
+Add-Dir "C:\WindowsImageBackup"
+
+# Recycle Bin & user folders
+Add-Dir "C:\`$Recycle.Bin"
+Add-Dir "%USERPROFILE%\Desktop"
+Add-Dir "%USERPROFILE%\Downloads"
+Add-Dir "%USERPROFILE%\Documents"
+Add-Dir "%APPDATA%"
+Add-Dir "%LOCALAPPDATA%\Temp"
+
+Write-Host "[FILE SYSTEM]" -ForegroundColor Cyan
+foreach ($raw in $fsDirs) {
+    $dir = [System.Environment]::ExpandEnvironmentVariables($raw)
+    if (-not (Test-Path $dir -PathType Container)) { continue }
+    if (-not $visitedDirs.Add($dir)) { continue }
+    Get-ChildItem -Path $dir -Force -Recurse -File |
+        Where-Object { $_.BaseName -ieq $target } |
+        ForEach-Object {
+            if ($foundFileSet.Add($_.FullName)) {
+                $foundFiles.Add($_.FullName)
+                Write-Host "  FILE: $($_.FullName)" -ForegroundColor Gray
+            }
+        }
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# PART 2 — REGISTRY SEARCH
+# ═══════════════════════════════════════════════════════════════════
+
+# Each match stored as: [PSCustomObject]@{ Display; Action }
+# Action is a scriptblock that performs the deletion
+$foundReg       = [System.Collections.Generic.List[PSCustomObject]]::new()
+$foundRegKeys   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$visitedRegPaths = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+function Convert-RegPath($path) {
+    $path = $path -replace '^HKLM\\', 'HKLM:\' `
+                  -replace '^HKCU\\', 'HKCU:\' `
+                  -replace '^HKCR\\', 'HKCR:\' `
+                  -replace '^HKCC\\', 'HKCC:\'
+    return $path
+}
+
+function Search-RegKey {
+    param([string]$psPath, [string]$pattern, [int]$depth = 3)
+    if (-not $visitedRegPaths.Add($psPath)) { return }
+    if (-not (Test-Path $psPath)) { return }
+
+    try {
+        $key = Get-Item -LiteralPath $psPath -ErrorAction Stop
+
+        # Check each value at this key
+        foreach ($valName in $key.GetValueNames()) {
+            $matched = $false
+            $display = ""
+            $act = $null
+
+            # Match on value NAME
+            if ($valName -imatch $pattern) {
+                $display = "REG VALUE NAME match`n    Key : $psPath`n    Val : $valName"
+                $n = $valName
+                $p = $psPath
+                $act = { Remove-ItemProperty -LiteralPath $p -Name $n -Force }.GetNewClosure()
+                $matched = $true
+            }
+
+            # Match on value DATA (string types only)
+            if (-not $matched) {
+                try {
+                    $raw = $key.GetValue($valName)
+                    $str = switch ($raw) {
+                        { $_ -is [string]   } { $raw }
+                        { $_ -is [string[]] } { $raw -join ' ' }
+                        default               { "" }
+                    }
+                    if ($str -imatch $pattern) {
+                        $display = "REG VALUE DATA match`n    Key : $psPath`n    Val : $valName`n    Data: $str"
+                        $n = $valName; $p = $psPath
+                        $act = { Remove-ItemProperty -LiteralPath $p -Name $n -Force }.GetNewClosure()
+                        $matched = $true
+                    }
+                } catch {}
+            }
+
+            if ($matched) {
+                $dedupKey = "$psPath|$valName"
+                if ($script:foundRegKeys.Add($dedupKey)) {
+                    $foundReg.Add([PSCustomObject]@{ Display = $display; Action = $act })
+                    Write-Host "  REG : $display" -ForegroundColor DarkYellow
+                }
+            }
+        }
+
+        # Check subkey names
+        if ($depth -gt 0) {
+            Get-ChildItem -LiteralPath $psPath -ErrorAction Stop | ForEach-Object {
+                $child = $_
+                if ($child.PSChildName -imatch $pattern) {
+                    $cp = $child.PSPath
+                    $display = "REG SUBKEY NAME match`n    Key : $($child.PSPath)"
+                    $dedupKey = "SUBKEY|$cp"
+                    if ($script:foundRegKeys.Add($dedupKey)) {
+                        $act = { Remove-Item -LiteralPath $cp -Recurse -Force }.GetNewClosure()
+                        $foundReg.Add([PSCustomObject]@{ Display = $display; Action = $act })
+                        Write-Host "  REG : $display" -ForegroundColor DarkYellow
+                    }
+                }
+                Search-RegKey -psPath $child.PSPath -pattern $pattern -depth ($depth - 1)
+            }
+        }
+    } catch {}
+}
+
+# All registry paths from message (3).txt
+$regPaths = @(
+    # Registry — Program Execution
+    "HKLM\SYSTEM\CurrentControlSet\Services\Bam\UserSettings"
+    "HKLM\SYSTEM\CurrentControlSet\Services\Dam\UserSettings"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\OpenSavePidlMRU"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\LastVisitedPidlMRU"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\CIDSizeMRU"
+    "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Amcache"
+    "HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Persisted"
+    "HKCU\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"
+    "HKLM\SOFTWARE\Microsoft\RADAR\HeapLeakDetection\DiagnosedApplications"
+    "HKCU\SOFTWARE\Microsoft\DirectInput"
+    "HKLM\SOFTWARE\Microsoft\Tracing"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FeatureUsage"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FeatureUsage\ShowJumpView"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FeatureUsage\AppSwitched"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ProgramDataUpdater"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\FileExts"
+
+    # Registry — USB & Device
+    "HKLM\SYSTEM\CurrentControlSet\Enum\USBSTOR"
+    "HKLM\SYSTEM\CurrentControlSet\Enum\USB"
+    "HKLM\SYSTEM\CurrentControlSet\Enum\SCSI"
+    "HKLM\SYSTEM\CurrentControlSet\Enum\IDE"
+    "HKLM\SYSTEM\CurrentControlSet\Enum\HID"
+    "HKLM\SYSTEM\CurrentControlSet\Enum\Bluetooth"
+    "HKLM\SYSTEM\CurrentControlSet\Control\DeviceClasses"
+    "HKLM\SYSTEM\CurrentControlSet\Control\usbflags"
+    "HKLM\SYSTEM\CurrentControlSet\Services\usbhub"
+    "HKLM\SYSTEM\CurrentControlSet\Services\usbstor"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\MountPoints2"
+    "HKLM\SOFTWARE\Microsoft\Windows Portable Devices\Devices"
+    "HKLM\SYSTEM\MountedDevices"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceMetadata"
+    "HKLM\SYSTEM\CurrentControlSet\Control\StorageDevicePolicies"
+
+    # Registry — Network & Connection
+    "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+    "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Profiles"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Managed"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Signatures\Unmanaged"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections"
+    "HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\Connections"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\HomeGroup"
+    "HKCU\SOFTWARE\Microsoft\Terminal Server Client\Default"
+    "HKCU\SOFTWARE\Microsoft\Terminal Server Client\Servers"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\NetworkList\Nla\Cache"
+    "HKLM\SYSTEM\CurrentControlSet\Services\NetBT\Parameters"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Map Network Drive MRU"
+    "HKLM\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters"
+    "HKLM\SYSTEM\CurrentControlSet\Services\LanmanServer\Shares"
+
+    # Registry — Installation & Software
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    "HKLM\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UpgradeCodes"
+    "HKLM\SOFTWARE\Classes\Installer\Products"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+    "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\KnownDLLs"
+    "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations"
+    "HKLM\SYSTEM\CurrentControlSet\Control\SafeBoot"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit"
+
+    # Registry — Shell & Explorer
+    "HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\BagMRU"
+    "HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\Bags"
+    "HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\WordWheelQuery"
+    "HKLM\SOFTWARE\Microsoft\Windows Search\VolumeInfoCache"
+    "HKCU\SOFTWARE\WinRAR\DialogEditHistory\ArcName"
+    "HKCU\SOFTWARE\WinRAR\ArcHistory"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Applets\Wordpad\Recent File List"
+    "HKCU\SOFTWARE\Microsoft\Office\16.0\Word\File MRU"
+    "HKCU\SOFTWARE\Microsoft\Office\16.0\Excel\File MRU"
+    "HKCU\SOFTWARE\Microsoft\Office\16.0\PowerPoint\File MRU"
+    "HKCU\SOFTWARE\Microsoft\Office\16.0\Common\Open Find\Microsoft Word\Settings\Last Visited File"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\DisallowRun"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\RestrictRun"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SRUM"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Taskband"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+    "HKCU\SOFTWARE\Microsoft\Windows\Shell\Associations\UrlAssociations"
+
+    # Registry — Identity & Security
+    "HKLM\SAM\SAM\Domains\Account\Users"
+    "HKLM\SAM\SAM\Domains\Account\Groups"
+    "HKLM\SECURITY\Policy\Accounts"
+    "HKLM\SECURITY\Policy\PolAdtEv"
+    "HKLM\SECURITY\Policy\SecDesc"
+    "HKLM\SECURITY\Cache"
+    "HKLM\SYSTEM\CurrentControlSet\Control\Lsa"
+    "HKLM\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\SpecialAccounts\UserList"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History"
+    "HKCU\SOFTWARE\Policies\Microsoft\Windows"
+    "HKLM\SOFTWARE\Policies\Microsoft\Windows Defender"
+    "HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies"
+
+    # Registry — Scheduler & Services
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tasks"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Boot"
+    "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Logon"
+    "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\BootExecute"
+    "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\SetupExecute"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32"
+    "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"
+
+    # Registry — Shadow Copy / Backup
+    "HKLM\SYSTEM\CurrentControlSet\Control\BackupRestore"
+)
+
+Write-Host ""
+Write-Host "[REGISTRY]" -ForegroundColor Cyan
+foreach ($raw in $regPaths) {
+    $psPath = Convert-RegPath $raw
+    Search-RegKey -psPath $psPath -pattern $escaped -depth 3
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# RESULTS & DELETION
+# ═══════════════════════════════════════════════════════════════════
+
+$totalFiles = $foundFiles.Count
+$totalReg   = $foundReg.Count
+$total      = $totalFiles + $totalReg
+
+Write-Host ""
+if ($total -eq 0) {
+    Write-Host "Nothing named '$target' found anywhere." -ForegroundColor Yellow
+} else {
+    Write-Host "─────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host "Found: $totalFiles file(s)  |  $totalReg registry match(es)" -ForegroundColor Green
+    Write-Host "─────────────────────────────────────────" -ForegroundColor DarkGray
+    Write-Host ""
+    $confirm = Read-Host "Delete ALL of the above? (y/n)"
+    if ($confirm -ieq "y") {
+        $deleted = 0
+
+        foreach ($f in $foundFiles) {
+            Remove-Item $f -Force
+            Write-Host "  Deleted file : $f" -ForegroundColor Red
+            $deleted++
+        }
+
+        foreach ($r in $foundReg) {
+            try {
+                & $r.Action
+                Write-Host "  Deleted reg  : $($r.Display -replace "`n    ", ' | ')" -ForegroundColor DarkRed
+                $deleted++
+            } catch {
+                Write-Host "  FAILED reg   : $($r.Display -replace "`n    ", ' | ')" -ForegroundColor Magenta
+            }
+        }
+
+        Write-Host ""
+        Write-Host "Done. $deleted item(s) deleted." -ForegroundColor Cyan
+    } else {
+        Write-Host "Cancelled. Nothing deleted." -ForegroundColor Yellow
+    }
+}
+
+# ─────────────────────────────────────────────
+# CLEAN OWN EXECUTION TRACES
+# ─────────────────────────────────────────────
+Write-Host ""
+Write-Host "[*] Cleaning execution traces..." -ForegroundColor Cyan
+
+function Invoke-Trace {
+    param([string]$label, [scriptblock]$action)
+    try {
+        & $action
+        Write-Host "  [OK]   $label" -ForegroundColor Green
+    } catch {
+        Write-Host "  [FAIL] $label — $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+# DNS cache
+Invoke-Trace "DNS cache" {
+    $r = Start-Process "ipconfig" -ArgumentList "/flushdns" -WindowStyle Hidden -Wait -PassThru
+    if ($r.ExitCode -ne 0) { throw "ipconfig /flushdns exited $($r.ExitCode)" }
+}
+
+# PSReadLine history
+Invoke-Trace "PSReadLine history" {
+    Remove-Item "$env:APPDATA\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt" -Force -ErrorAction Stop
+}
+
+# PowerShell event logs
+Invoke-Trace "PowerShell Operational event log" {
+    $out = & wevtutil cl "Microsoft-Windows-PowerShell/Operational" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw $out }
+}
+Invoke-Trace "Windows PowerShell event log" {
+    $out = & wevtutil cl "Windows PowerShell" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw $out }
+}
+
+# Security log (Event ID 4688 — process creation)
+Invoke-Trace "Security event log" {
+    $out = & wevtutil cl "Security" 2>&1
+    if ($LASTEXITCODE -ne 0) { throw $out }
+}
+
+# BAM / DAM
+Invoke-Trace "BAM State\UserSettings registry" {
+    $out = & reg delete "HKLM\SYSTEM\CurrentControlSet\Services\Bam\State\UserSettings" /f 2>&1
+    if ($LASTEXITCODE -ne 0) { throw $out }
+}
+Invoke-Trace "BAM UserSettings registry" {
+    $out = & reg delete "HKLM\SYSTEM\CurrentControlSet\Services\Bam\UserSettings" /f 2>&1
+    if ($LASTEXITCODE -ne 0) { throw $out }
+}
+Invoke-Trace "DAM UserSettings registry" {
+    $out = & reg delete "HKLM\SYSTEM\CurrentControlSet\Services\Dam\UserSettings" /f 2>&1
+    if ($LASTEXITCODE -ne 0) { throw $out }
+}
+
+# Firewall log
+Invoke-Trace "Firewall log" {
+    Remove-Item "C:\Windows\System32\LogFiles\Firewall\pfirewall.log"     -Force -ErrorAction Stop
+}
+Invoke-Trace "Firewall log (old)" {
+    Remove-Item "C:\Windows\System32\LogFiles\Firewall\pfirewall.log.old" -Force -ErrorAction Stop
+}
+
+# WebCache (HTTPS request to GitHub)
+Invoke-Trace "WebCache (CDPSvc stop)" {
+    Stop-Service -Name "CDPSvc" -Force -ErrorAction Stop
+}
+Invoke-Trace "WebCache files" {
+    Remove-Item "$env:LOCALAPPDATA\Microsoft\Windows\WebCache\*" -Recurse -Force -ErrorAction Stop
+}
+Invoke-Trace "WebCache (CDPSvc restart)" {
+    Start-Service -Name "CDPSvc" -ErrorAction Stop
+}
+
+# Amcache
+Invoke-Trace "Amcache.hve" {
+    Remove-Item "C:\Windows\AppCompat\Programs\Amcache.hve"         -Force -ErrorAction Stop
+}
+Invoke-Trace "Amcache.hve.LOG1" {
+    Remove-Item "C:\Windows\AppCompat\Programs\Amcache.hve.LOG1"    -Force -ErrorAction Stop
+}
+Invoke-Trace "Amcache.hve.LOG2" {
+    Remove-Item "C:\Windows\AppCompat\Programs\Amcache.hve.LOG2"    -Force -ErrorAction Stop
+}
+Invoke-Trace "RecentFileCache.bcf" {
+    Remove-Item "C:\Windows\AppCompat\Programs\RecentFileCache.bcf" -Force -ErrorAction Stop
+}
+
+# ETL AutoLogger
+Invoke-Trace "ETL AutoLogger logs" {
+    Remove-Item "C:\ProgramData\Microsoft\Diagnosis\ETLLogs\AutoLogger\*" -Recurse -Force -ErrorAction Stop
+}
+
+Write-Host ""
+exit
